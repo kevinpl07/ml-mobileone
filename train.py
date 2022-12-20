@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from torchvision.transforms.functional import center_crop, resize
 from torchvision import transforms as T
 from torchvision import utils
-from segmentation_models_pytorch.datasets import VideoMattingDataset
+from segmentation_models_pytorch.datasets import VideoMattingDataset, StreamfogDataset
 from pytorch_lightning.loggers import TensorBoardLogger
 from mobileone import mobileone, reparameterize_model
 from PIL import Image
@@ -31,37 +31,32 @@ class OverlayWrapperModel(torch.nn.Module):
         alpha[output_logits > 0.5] = 0
         return  torch.nn.functional.interpolate(overlay * alpha + input_img * (1 - alpha), (720, 1280), mode="nearest")
 
-    # def forward(self, input_img, overlay_img):
-    #     overlay, alpha = torch.split(overlay_img, [3, 1], dim=1)
-    #     output_logits = self.net(input_img).sigmoid()
-    #     alpha[output_logits > 0.5] = 0
-    #     return  torch.nn.functional.interpolate(overlay * alpha + input_img * (1 - alpha), (720, 1280), mode="bilinear", align_corners=True)
-
-
-
 if __name__ == '__main__':
 
     root = "/Users/kev/Downloads/VideoMatte240K_JPEG_HD"
-    backgrounds = "/Users/kev/Desktop/projects/kevs_playground/whamen_imgs/bgs/"
+    # backgrounds = "/Users/kev/Desktop/projects/kevs_playground/whamen_imgs/bgs/"
+
+    backgrounds_official = "/Users/kev/Downloads/Backgrounds/rooms/"
 
     # init train, val, test sets
-    train_dataset = VideoMattingDataset(root, backgrounds, "train")
-    valid_dataset = VideoMattingDataset(root, backgrounds, "valid")
-    test_dataset = VideoMattingDataset(root, backgrounds, "test")
+    # train_dataset = VideoMattingDataset(root, backgrounds_official, "train")
+    # test_dataset = VideoMattingDataset(root, backgrounds_official, "test")
+    # valid_dataset = VideoMattingDataset(root, backgrounds, "valid")
+    train_dataset = StreamfogDataset("/Users/kev/Desktop/projects/kevs_playground/ml-mobileone/tiny_dataset/", "train")
+    valid_dataset = StreamfogDataset("/Users/kev/Desktop/projects/kevs_playground/ml-mobileone/tiny_dataset/", "valid")
 
     # # It is a good practice to check datasets don`t intersects with each other
-    assert set(test_dataset.filenames).isdisjoint(set(train_dataset.filenames))
-    assert set(test_dataset.filenames).isdisjoint(set(valid_dataset.filenames))
+    # assert set(test_dataset.filenames).isdisjoint(set(train_dataset.filenames))
+    # assert set(test_dataset.filenames).isdisjoint(set(valid_dataset.filenames))
     assert set(train_dataset.filenames).isdisjoint(set(valid_dataset.filenames))
 
     print(f"Train size: {len(train_dataset)}")
     print(f"Valid size: {len(valid_dataset)}")
-    print(f"Test size: {len(test_dataset)}")
+    # print(f"Test size: {len(test_dataset)}")
 
-    n_cpu = os.cpu_count() // 2
-    train_dataloader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=n_cpu)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=16, shuffle=True, num_workers=n_cpu)
-    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=n_cpu)
+    n_cpu = os.cpu_count() - 1 
+    train_dataloader = DataLoader(train_dataset, batch_size=12, shuffle=True, num_workers=n_cpu)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=5, shuffle=False, num_workers=n_cpu)
 
     class PetModel(pl.LightningModule):
 
@@ -70,7 +65,6 @@ if __name__ == '__main__':
             self.model = smp.create_model(
                 arch, encoder_name=encoder_name, in_channels=in_channels, classes=out_classes, **kwargs
             )
-            
             # preprocessing parameteres for image
             params = smp.encoders.get_preprocessing_params(encoder_name)
             self.register_buffer("std", torch.tensor(params["std"]).view(1, 3, 1, 1))
@@ -86,11 +80,11 @@ if __name__ == '__main__':
             for k, v in checkpoint.items():
                 name = k.replace("model.", '') # remove `module.`
                 new_state_dict[name] = v
-            new_state_dict.pop("std")
-            new_state_dict.pop("mean")
+            self.std = new_state_dict.pop("std")
+            self.mean = new_state_dict.pop("mean")
             self.model.load_state_dict(new_state_dict)
-            self.model.eval()
-            self.model = reparameterize_model(model)
+            
+            # self.model = reparameterize_model(model)
 
         def forward(self, image):
             # normalize image here
@@ -112,44 +106,35 @@ if __name__ == '__main__':
 
 
             true_src = true_bgr.clone()
-            augment = False
+
+
+            augment = True
             
             # Augment with shadow
             if augment and stage == "train":
                 aug_shadow_idx = torch.rand(len(true_src)) < 0.3
                 if aug_shadow_idx.any():
                     aug_shadow = true_pha[aug_shadow_idx].mul(0.3 * random.random())
-                    aug_shadow = T.RandomAffine(degrees=(-5, 5), translate=(0.2, 0.2), scale=(0.5, 1.5), shear=(-5, 5))(aug_shadow)
+                    aug_shadow = T.RandomAffine(degrees=(-20, 20), translate=(0.2, 0.2), scale=(0.5, 1.5), shear=(-5, 5))(aug_shadow)
                     aug_shadow = kornia.filters.box_blur(aug_shadow, (random.choice(range(20, 40)),) * 2)
                     true_src[aug_shadow_idx] = true_src[aug_shadow_idx].sub_(aug_shadow).clamp_(0, 1)
                     del aug_shadow
                 del aug_shadow_idx
-            
-            # Composite foreground onto source
+
             true_src = true_fgr * true_pha + true_src * (1 - true_pha)
+
 
             if augment and stage == "train":
             # Augment with noise
-                aug_noise_idx = torch.rand(len(true_src)) < 0.4
-                if aug_noise_idx.any():
-                    true_src[aug_noise_idx] = true_src[aug_noise_idx].add_(torch.randn_like(true_src[aug_noise_idx]).mul_(0.03 * random.random())).clamp_(0, 1)
-                    true_bgr[aug_noise_idx] = true_bgr[aug_noise_idx].add_(torch.randn_like(true_bgr[aug_noise_idx]).mul_(0.03 * random.random())).clamp_(0, 1)
-                del aug_noise_idx
-                
-                # Augment background with jitter
-                aug_jitter_idx = torch.rand(len(true_src)) < 0.8
-                if aug_jitter_idx.any():
-                    true_bgr[aug_jitter_idx] = kornia.augmentation.ColorJitter(0.18, 0.18, 0.18, 0.1)(true_bgr[aug_jitter_idx])
-                del aug_jitter_idx
-                
-                # Augment background with affine
-                aug_affine_idx = torch.rand(len(true_bgr)) < 0.3
-                if aug_affine_idx.any():
-                    true_bgr[aug_affine_idx] = T.RandomAffine(degrees=(0.0), translate=(0.01, 0.01))(true_bgr[aug_affine_idx])
-                del aug_affine_idx
-            
+                true_src = true_src.add_(torch.randn_like(true_src).mul_(0.1 * random.random())).clamp_(0, 1)
+    
+                # true_src = kornia.augmentation.ColorJitter([0.5, 1.0], 0.5, 0.5, 0.0)(true_src)
+                true_src = kornia.augmentation.ColorJitter(0.5, 0.5, 0.5, 0.0)(true_src)
 
+                true_src = T.GaussianBlur(kernel_size=9, sigma=(0.1, 3))(true_src)
 
+            true_src = torch.nn.functional.interpolate(true_src, (288, 512), mode="bilinear")
+            true_pha = torch.nn.functional.interpolate(true_pha, (288, 512), mode="bilinear")
             # true_fgr, true_pha, true_bgr = random_crop(true_fgr, true_pha, true_bgr)
             # true_src = true_fgr * true_pha + true_bgr * (1 - true_pha)
             # true_pha[true_pha > 0] = 1
@@ -174,25 +159,28 @@ if __name__ == '__main__':
             # Check that mask values in between 0 and 1, NOT 0 and 255 for binary segmentation
             assert true_pha.max() <= 1.0 and true_pha.min() >= 0
 
-
+            
             logits_mask = self.forward(true_src)
             
             # Predicted mask contains logits, and loss_fn param `from_logits` is set to True
             loss = self.loss_fn(logits_mask, true_pha)
 
-            self.log("loss", loss)
+
+            if stage == "train":
+                self.log("loss", loss)
             
 
             if stage == "valid":
+                self.log("val_loss", loss)
                 imgs = []
 
                 for img_idx in range(true_src.shape[0]):
-                    imgs.extend([true_src[img_idx], true_pha[img_idx].expand(3, 256, 512), logits_mask[img_idx].sigmoid().expand(3, 256, 512)])
+                    imgs.extend([true_src[img_idx], true_pha[img_idx].expand(3, 288, 512), logits_mask[img_idx].sigmoid().expand(3, 288, 512)])
                 grid = utils.make_grid(imgs, nrow=3)
                 self.logger.experiment.add_image('masks', grid, self.global_step)
 
             # Lets compute metrics for some threshold
-            # first convert mask values to probabilities, then 
+            # first convert mask values to probabilities, then
             # apply thresholding
             prob_mask = logits_mask.sigmoid()
             pred_mask = (prob_mask > 0.5).float()
@@ -239,7 +227,7 @@ if __name__ == '__main__':
             self.log_dict(metrics, prog_bar=True)
 
         def training_step(self, batch, batch_idx):
-            return self.shared_step(batch, "train")            
+            return self.shared_step(batch, "train")       
 
         def training_epoch_end(self, outputs):
             return self.shared_epoch_end(outputs, "train")
@@ -263,26 +251,35 @@ if __name__ == '__main__':
     trainer = pl.Trainer(
         logger=tb_logger,
         log_every_n_steps=1,
-        val_check_interval=100,
+        # val_check_interval=50,
         limit_val_batches=1,
-        max_time="00:05:00:00"
+        check_val_every_n_epoch=25,
+        # max_epochs=5,
+        max_time="00:14:00:00"
     )
 
-    model = PetModel("deeplabv3plus", "mobileone_s0", in_channels=3, out_classes=1)
-
+    model = PetModel("pan", "mobileone_s0", in_channels=3, out_classes=1)
+    # model = reparameterize_model(model)
+    checkpoint = torch.load("only_rooms_unfused.pth")
+    model.load(checkpoint=checkpoint)
+    # model.train()
     trainer.fit(
         model,
         train_dataloaders=train_dataloader,
         val_dataloaders=valid_dataloader,
     )
 
-    torch.save(model.state_dict(), "deeplab_dice.pth")
+    torch.save(model.state_dict(), "finetuned_2_288_unfused.pth")
+    model.eval()
+    model = reparameterize_model(model)
+
+    torch.save(model.state_dict(), "finetuned_2_288_unfused.pth")
     
     # checkpoint = torch.load("model_m1_s0_pan.pth")
     # model.load(checkpoint=checkpoint)
     # model.load_state_dict(checkpoint, strict=False)
-    model.eval()
-    model = reparameterize_model(model)
+    # model.eval()
+    # model = reparameterize_model(model)
 
     # wrapper_model = OverlayWrapperModel(model)
 
@@ -300,7 +297,7 @@ if __name__ == '__main__':
     # bgr_image.save("background_resized.png")
     transform =  transforms.ToTensor()
 
-    whamen_image = Image.open("/Users/kev/Desktop/projects/kevs_playground/whamen_imgs/image (5).png").convert("RGB").resize((512, 256))
+    whamen_image = Image.open("/Users/kev/Desktop/projects/kevs_playground/whamen_imgs/test_set/image (5).png").convert("RGB").resize((512, 256))
 
     whamen_image = transform(whamen_image).unsqueeze(0)
 
